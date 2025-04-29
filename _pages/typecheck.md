@@ -421,7 +421,7 @@ type A = Callback<(number, string), ...number>
 
 ## Adding types for faux object oriented programs
 
-One common pattern we see with existing Lua/Luau code is the following OO code. While Luau is capable of inferring a decent chunk of this code, it cannot pin down on the types of `self` when it spans multiple methods.
+One common pattern we see with existing Lua/Luau code is the following object-oriented code. While Luau is capable of inferring a decent chunk of this code, it cannot pin down on the types of `self` when it spans multiple methods.
 
 ```lua
 local Account = {}
@@ -450,27 +450,28 @@ local account = Account.new("Alexander", 500)
 
 For example, the type of `Account.new` is `<a, b>(name: a, balance: b) -> { ..., name: a, balance: b, ... }` (snipping out the metatable). For better or worse, this means you are allowed to call `Account.new(5, "hello")` as well as `Account.new({}, {})`. In this case, this is quite unfortunate, so your first attempt may be to add type annotations to the parameters `name` and `balance`.
 
-There's the next problem: the type of `self` is not shared across methods of `Account`, this is because you are allowed to explicitly opt for a different value to pass as `self` by writing `account.deposit(another_account, 50)`. As a result, the type of `Account:deposit` is `<a, b>(self: { balance: a }, credit: b) -> ()`. Consequently, Luau cannot infer the result of the `+` operation from `a` and `b`, so a type error is reported.
+There's the next problem: the type of `self` is not shared across methods of `Account`, this is because you are allowed to explicitly opt for a different value to pass as `self` by writing `account.deposit(another_account, 50)`. As a result, the type of `Account:deposit` is `<a, b>(self: { balance: a }, credit: b) -> ()`. Consequently, Luau cannot infer the result of the `+` operation from `a` and `b`, so a type error is reported. 
 
-We can see there's a lot of problems happening here. This is a case where you will have to guide Luau, but using the power of top-down type inference you only need to do this in _exactly one_ place!
+We can see there's a lot of problems happening here. This is a case where you'll have to provide some guidance to Luau in the form of annotations today, but the process is straightforward and without repetition. You first specify the type of _data_ you want your class to have, and then you define the class type separately with `setmetatable` (either via `typeof`, or in the New Type Solver, the `setmetatable` type function).
+From then on, you can explicitly annotate the `self` type of each method with your class type! Note that while the definition is written e.g. `Account.deposit`, you can still call it as `account:deposit(...)`.
 
 ```lua
-type AccountImpl = {
-    __index: AccountImpl,
-    new: (name: string, balance: number) -> Account,
-    deposit: (self: Account, credit: number) -> (),
-    withdraw: (self: Account, debit: number) -> (),
-}
-
-type Account = typeof(setmetatable({} :: { name: string, balance: number }, {} :: AccountImpl))
-
--- Only these two annotations are necessary
-local Account: AccountImpl = {} :: AccountImpl
+local Account = {}
 Account.__index = Account
 
--- Using the knowledge of `Account`, we can take in information of the `new` type from `AccountImpl`, so:
--- Account.new :: (name: string, balance: number) -> Account
-function Account.new(name, balance)
+type AccountData = {
+    name: string,
+    balance: number,
+}
+
+export type Account = typeof(setmetatable({} :: AccountData, Account))
+-- or alternatively, in the new type solver...
+-- export type Account = setmetatable<AccountData, typeof(Account)>
+
+
+-- this return annotation is not required, but ensures that you cannot
+-- accidentally make the constructor incompatible with the methods
+function Account.new(name, balance): Account
     local self = {}
     self.name = name
     self.balance = balance
@@ -478,20 +479,23 @@ function Account.new(name, balance)
     return setmetatable(self, Account)
 end
 
--- Ditto:
--- Account:deposit :: (self: Account, credit: number) -> ()
-function Account:deposit(credit)
+-- this annotation on `self` is the only _required_ annotation.
+function Account.deposit(self: Account, credit)
+    -- autocomplete on `self` works here!
     self.balance += credit
 end
 
--- Ditto:
--- Account:withdraw :: (self: Account, debit: number) -> ()
-function Account:withdraw(debit)
+-- this annotation on `self` is the only _required_ annotation.
+function Account.withdraw(self: Account, debit)
+    -- autocomplete on `self` works here!
     self.balance -= debit
 end
 
-local account = Account.new("Alexander", 500)
+local account = Account.new("Hina", 500)
+account:deposit(20) -- this still works, and we had autocomplete after hitting `:`!
 ```
+
+Based on feedback, we plan to restrict the types of all functions defined with `:` syntax to [share their self types](https://rfcs.luau.org/shared-self-types.html). This will enable future versions of this code to work without any explicit `self` annotations because it amounts to having type inference make precisely the assumptions we are encoding with annotations here --- namely, that the type of the constructors and the method definitions is intended by the developer to be the same.
 
 ## Tagged unions
 
@@ -613,11 +617,22 @@ local myTable = {names = {} :: {string}}
 table.insert(myTable.names, 42)         -- not ok, invalid 'number' to 'string' conversion
 ```
 
-A typecast itself is also type checked to ensure the conversion is made to a subtype of the expression's type or `any`:
+A typecast itself is also type checked to ensure that one of the conversion operands is the subtype of the other or `any`:
 ```lua
 local numericValue = 1
 local value = numericValue :: any             -- ok, all expressions may be cast to 'any'
 local flag = numericValue :: boolean          -- not ok, invalid 'number' to 'boolean' conversion
+```
+
+When typecasting a variadic or the result of a function with multiple returns, only the first value will be preserved. The rest will be discarded.
+```luau
+function returnsMultiple(...): (number, number, number)
+    print(... :: string) -- "x"
+    return 1, 2, 3
+end
+
+print(returnsMultiple("x", "y", "z")) -- 1, 2, 3
+print(returnsMultiple("x", "y", "z") :: number) -- 1
 ```
 
 ## Roblox types
@@ -684,3 +699,401 @@ Cyclic module dependencies can cause problems for the type checker.  In order to
 ```lua
 local myModule = require(MyModule) :: any
 ```
+
+## Type functions
+
+Type functions are functions that run during analysis time and operate on types, instead of runtime values. They can use the [types](#types-library) library to transform existing types or create new ones.
+
+
+Here's a simplified implementation of the builtin type function `keyof`. It takes a table type and returns its property names as a [union](typecheck#union-types) of [singletons](typecheck#singleton-types-aka-literal-types).
+
+```lua
+type function simple_keyof(ty)
+    -- Ignoring unions or intersections of tables for simplicity.
+    if not ty:is("table") then
+        error("Can only call keyof on tables.")
+    end
+
+    local union = nil
+
+    for property in ty:properties() do
+        union = if union then types.unionof(union, property) else property
+    end
+
+    return if union then union else types.singleton(nil)
+end
+
+type person = {
+    name: string,
+    age: number,
+}
+--- keys = "age" | "name"
+type keys = simple_keyof<person>
+```
+
+### Type function environment
+
+In addition to the [types](#types-library) library, type functions have access to:
+
+* `assert`, `errror`, `print`
+* `next`, `ipairs`, `pairs`
+* `select`, `unpack`
+* `getmetatable`, `setmetatable`
+* `rawget`, `rawset`, `rawlen`, `raweq`
+* `tonumber`, `tostring`
+* `type`, `typeof`
+* `math` library
+* `table` library
+* `string` library
+* `bit32` library
+* `utf8` library
+* `buffer` library
+
+## types library
+
+The `types` library is used to create and transform types, and can only be used within [type functions](#type-functions).
+
+### `types` library properties
+
+```luau
+types.any
+```
+
+The [any](typecheck#any-type) `type`.
+
+```luau
+types.unknown
+```
+
+The [unknown](typecheck#unknown-type) `type`.
+
+```luau
+types.never
+```
+
+The [never](typecheck#never-type) `type`.
+
+```luau
+types.boolean
+```
+
+The boolean `type`.
+
+```luau
+types.buffer
+```
+
+The [buffer](library#buffer-library) `type`.
+
+```luau
+types.number
+```
+
+The number `type`.
+
+```luau
+types.string
+```
+
+The string `type`.
+
+```luau
+types.thread
+```
+
+The thread `type`.
+
+## `types` library functions
+
+```luau
+types.singleton(arg: string | boolean | nil): type
+```
+
+Returns the [singleton](typecheck#singleton-types-aka-literal-types) type of the argument.
+
+```luau
+types.negationof(arg: type): type
+```
+
+Returns an immutable negation of the argument type.
+
+```luau
+types.unionof(first: type, second: type, ...: type): type
+```
+
+Returns an immutable [union](typecheck#union-types) of two or more arguments.
+
+```luau
+types.intersectionof(first: type, second: type, ...: type): type
+```
+
+Returns an immutable [intersection](typecheck#intersection-types) of two or more arguments.
+
+```luau
+types.newtable(props: { [type]: type | { read: type?, write: type? } }?, indexer: { index: type, readresult: type, writeresult: type? }?, metatable: type?): type
+```
+
+Returns a fresh, mutable table `type`. Property keys must be string singleton `type`s. The table's metatable is set if one is provided.
+
+```luau
+types.newfunction(parameters: { head: {type}?, tail: type? }, returns: { head: {type}?, tail: type? }?, generics: {type}?): type
+```
+
+Returns a fresh, mutable function `type`, using the ordered parameters of `head` and the variadic tail of `tail`.
+
+```luau
+types.copy(arg: type): type
+```
+
+Returns a deep copy of the argument type.
+
+```luau
+types.generic(name: string?, ispack: boolean?): type
+```
+
+Creates a [generic](typecheck#generic-functions) named `name`. If `ispack` is `true`, the result is a [generic pack](typecheck#type-packs).
+
+### `type` instance
+
+`type` instances can have extra properties and methods described in subsections depending on its tag.
+
+```luau
+type.tag: "nil" | "unknown" | "never" | "any" | "boolean" | "number" | "string" | "singleton" | "negation" | "union" | "intersection" | "table" | "function" | "class" | "thread" | "buffer"
+```
+
+An immutable property holding the type's tag.
+
+```luau
+__eq(arg: type): boolean
+```
+
+Overrides the `==` operator to return `true` if `self` is syntactically equal to `arg`. This excludes semantically equivalent types, `true | false` is unequal to `boolean`.
+
+```luau
+type:is(arg: "nil" | "unknown" | "never" | "any" | "boolean" | "number" | "string" | "singleton" | "negation" | "union" | "intersection" | "table" | "function" | "class" | "thread" | "buffer")
+```
+
+Returns `true` if `self` has the argument as its tag.
+
+### Singleton `type` instance
+
+```luau
+singletontype:value(): boolean | nil | "string"
+```
+
+Returns the singleton's actual value, like `true` for `types.singleton(true)`.
+
+### Generic `type` instance
+
+```luau
+generictype:name(): string?
+```
+
+Returns the name of the [generic](typecheck#generic-functions) or `nil` if it has no name.
+
+```luau
+generictype:ispack(): boolean
+```
+
+Returns `true` if the [generic](typecheck#generic-functions) is a [pack](typecheck#type-packs), or `false` otherwise.
+
+### Table `type` instance
+
+```luau
+tabletype:setproperty(key: type, value: type?)
+```
+
+Sets key-value pair in the table's properties, with the same type for reading from and writing to the table.
+
+- If `key` doesn't exist in the table, does nothing.
+- If `value` is `nil`, the property is removed.
+
+```luau
+tabletype:setreadproperty(key: type, value: type?)
+```
+
+Sets the key-value pair used for reading from the table's properties.
+
+- If `key` doesn't exist in the table, does nothing.
+- If `value` is `nil`, the property is removed.
+
+```luau
+tabletype:setwriteproperty(key: type, value: type?)
+```
+
+Sets the key-value pair used for writing to the table's properties.
+
+- If `key` doesn't exist in the table, does nothing.
+- If `value` is `nil`, the property is removed.
+
+```luau
+tabletype:readproperty(key: type): type?
+```
+
+Returns the type used for reading values from this property, or `nil` if the property doesn't exist.
+
+```luau
+tabletype:writeproperty(key: type): type?
+```
+
+Returns the type used for writing values to this property, or `nil` if the property doesn't exist.
+
+```luau
+tabletype:properties(): { [type]: { read: type?, write: type? } }
+```
+
+Returns a table mapping property keys to their read and write types.
+
+```luau
+tabletype:setindexer(index: type, result: type)
+```
+
+Sets the table's indexer, using the same type for reads and writes.
+
+```luau
+tabletype:setreadindexer(index: type, result: type)
+```
+
+Sets the table's indexer with the resulting read type.
+
+```luau
+tabletype:setwriteindexer(index: type, result: type)
+```
+
+Sets the table's indexer with the resulting write type.
+
+```luau
+tabletype:indexer(): { index: type, readresult: type, writeresult: type }
+```
+
+Returns the table's indexer as a table, or `nil` if it doesn't exist.
+
+```luau
+tabletype:readindexer(): { index: type, result: type }?
+```
+
+Returns the table's indexer using the result's read type, or `nil` if it doesn't exist.
+
+```luau
+tabletype:writeindexer()
+```
+
+Returns the table's indexer using the result's write type, or `nil` if it doesn't exist.
+
+```luau
+tabletype:setmetatable(arg: type)
+```
+
+Sets the table's metatable.
+
+```luau
+tabletype:metatable(): type?
+```
+
+Gets the table's metatable, or `nil` if it doesn't exist.
+
+### Function `type` instance
+
+```luau
+functiontype:setparameters(head: {type}?, tail: type?)
+```
+
+Sets the function's parameters, with the ordered parameters in `head` and the variadic tail in `tail`.
+
+```luau
+functiontype:parameters(): { head: {type}?, tail: type? }
+```
+
+Returns the function's parameters, with the ordered parameters in `head` and the variadic tail in `tail`.
+
+```luau
+functiontype:setreturns(head: {type}?, tail: type?)
+```
+
+Sets the function's return types, with the ordered parameters in `head` and the variadic tail in `tail`.
+
+```luau
+functiontype:returns(): { head: {type}?, tail: type? }
+```
+
+Returns the function's return types, with the ordered parameters in `head` and the variadic tail in `tail`.
+
+```luau
+functiontype:generics(): {type}
+```
+
+Returns an array of the function's [generic](typecheck#generic-functions) `type`s.
+
+```luau
+functiontype:setgenerics(generics: {type}?)
+```
+
+Sets the function's [generic](typecheck#generic-functions) `type`s.
+
+### Negation `type` instance
+
+```luau
+type:inner(): type
+```
+
+Returns the `type` being negated.
+
+### Union `type` instance
+
+```luau
+uniontype:components(): {type}
+```
+
+Returns an array of the [unioned](typecheck#union-types) types.
+
+### Intersection `type` instance
+
+```luau
+intersectiontype:components()
+```
+
+Returns an array of the [intersected](typecheck#intersection-types) types.
+
+### Class `type` instance
+
+```luau
+classtype:properties(): { [type]: { read: type?, write: type? } }
+```
+
+Returns the properties of the class with their respective `read` and `write` types.
+
+```luau
+classtype:readparent(): type?
+```
+
+Returns the `read` type of the class' parent class, or returns `nil` if the parent class doesn't exist.
+
+```luau
+classtype:writeparent(): type?
+```
+
+Returns the `write` type of the class' parent class, or returns `nil` if the parent class doesn't exist.
+
+```luau
+classtype:metatable(): type?
+```
+
+Returns the class' metatable or `nil` if it doesn't exist.
+
+```luau
+classtype:indexer(): { index: type, readresult: type, writeresult: type }?
+```
+
+Returns the class' indexer, or `nil` if it doesn't exist.
+
+```luau
+classtype:readindexer(): { index: type, result: type }?
+```
+
+Returns the class' indexer using the result's read type, or `nil` if it doesn't exist.
+
+```luau
+classtype:writeindexer(): { index: type, result: type }?
+```
+
+Returns the class' indexer using the result's write type, or `nil` if it doesn't exist.

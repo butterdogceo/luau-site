@@ -251,6 +251,13 @@ function math.ldexp(s: number, e: number): number
 Given the significand and a binary exponent, returns a number `s * 2^e`.
 
 ```
+function math.lerp(a: number, b: number, t: number): number
+```
+
+Linearly interpolated between number value `a` and `b` using factor `t`, generally returning the result of `a + (b - a) * t`.
+When `t` is exactly `1`, the value of `b` will be returned instead to ensure that when `t` is on the interval `[0, 1]`, the result of `lerp` will be on the interval `[a, b]`.
+
+```
 function math.log10(n: number): number
 ```
 
@@ -428,6 +435,7 @@ function table.unpack<V>(a: {V}, f: number?, t: number?): ...V
 ```
 
 Returns all values of `a` with indices in `[f..t]` range. `f` defaults to 1 and `t` defaults to `#a`.
+Note that if you want to unpack varargs packed with `table.pack` you have to specify the index fields because `table.unpack` doesn't automatically use the `n` field that `table.pack` creates. Example usage for packed varargs: `table.unpack(args, 1, args.n)`
 
 ```
 function table.move<V>(a: {V}, f: number, t: number, d: number, tt: {V}?)
@@ -443,10 +451,10 @@ Creates a table with `n` elements; all of them (range `[1..n]`) are set to `v`. 
 Note that preallocation is only performed for the array portion of the table - using `table.create` on dictionaries is counter-productive.
 
 ```
-function table.find<V>(t: {V}, v: V): number?
+function table.find<V>(t: {V}, v: V, init: number?): number?
 ```
 
-Find the first element in the table that is equal to `v` and returns its index; the traversal stops at the first `nil`. If the element is not found, `nil` is returned instead.
+Find the first element in the table that is equal to `v` and returns its index; the traversal stops at the first `nil`. If the element is not found, `nil` is returned instead. The traversal starts at index `init` if specified, otherwise 1.
 
 ```
 function table.clear(t: table)
